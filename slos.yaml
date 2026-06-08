@@ -1,0 +1,147 @@
+service: vision-moderation
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Partner SLA (external contract):
+#   • 99.5% monthly availability  →  ≤ 3.65 hours downtime/month
+#   • Latency commitment: p95 ≤ 250 ms (best-effort, no refund trigger)
+#   • Breach triggers pro-rated service credits
+#
+# Internal SLOs below are deliberately stricter than the external SLA so that
+# engineering is alerted and can remediate BEFORE the partner SLA is at risk.
+# ─────────────────────────────────────────────────────────────────────────────
+
+slos:
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # SLO 1 — Availability
+  # Stricter than partner SLA (99.9% internal vs 99.5% external) so burn-rate
+  # alerts fire with enough lead time to avoid a partner SLA breach.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: availability
+    description: >
+      Proportion of HTTP requests that complete with a non-5xx, non-timeout
+      response. Tied directly to the partner SLA (99.5% monthly availability).
+      Internal objective is set 0.4 pp stricter so alerts fire before the
+      external SLA window closes.
+    sli:
+      type: request_based
+      good_requests: >
+        HTTP responses where status_code is in [200, 201, 204, 400, 401, 403, 404, 422, 429]
+        AND response was received within 30 s (i.e. no upstream timeout).
+        4xx codes are counted as "good" because the service itself is functioning
+        correctly; the error is due to the caller. 5xx codes (500, 502, 503, 504)
+        and hard timeouts are "bad".
+      total_requests: All inbound HTTP requests that passed authentication.
+      measurement: >
+        Recorded by the Envoy sidecar on every request. Exported as Prometheus
+        counter `http_requests_total{status=~"[2345].."}`. Good = sum of 2xx+4xx;
+        bad = sum of 5xx + timeout_total.
+    objective: 0.999                # 99.9% over rolling 30-day window (internal)
+    window: 30d
+    external_sla_objective: 0.995   # 99.5% — partner contract; internal obj is stricter
+    error_budget_minutes_per_30d: 43.2   # (1 - 0.999) * 30 * 24 * 60
+    burn_rate_alerts:
+      # Page: consuming error budget 14.4× faster than allowed → will exhaust
+      # full 30-day budget in ~50 hours if sustained.
+      - severity: page
+        burn_rate: 14.4
+        window: 1h
+        rationale: >
+          At 14.4× burn rate, 1h of bad traffic consumes 14.4/720 ≈ 2% of the
+          monthly budget. If sustained for ~50 h the entire budget is gone;
+          page immediately to avoid partner SLA breach.
+      # Ticket: consuming budget 6× faster → budget exhausted in ~5 days.
+      - severity: ticket
+        burn_rate: 6
+        window: 6h
+        rationale: >
+          Slower burn; not an immediate outage but indicates a persistent
+          degradation. Create a ticket within the next business day.
+      # Info: 3× burn over 24 h — worth investigation but not urgent.
+      - severity: info
+        burn_rate: 3
+        window: 24h
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # SLO 2 — p95 Latency
+  # Maps directly to the 250 ms partner SLA commitment.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: latency_p95
+    description: >
+      95% of requests complete end-to-end (client send → first byte received)
+      within 250 ms, measured at the ingress load balancer.
+    sli:
+      type: request_based
+      good_requests: >
+        HTTP requests where end_to_end_latency_ms < 250.
+        Latency is measured from the timestamp of the first ingress byte received
+        to the timestamp of the last response byte sent, recorded by the Envoy
+        access log field `%RESPONSE_DURATION%`. Requests that result in an
+        upstream timeout are counted as bad (latency = ∞).
+      total_requests: >
+        All non-cancelled inbound HTTP requests (excludes client-aborted
+        connections before the response starts).
+      measurement: >
+        Prometheus histogram `http_request_duration_ms_bucket` with le="250"
+        exported from Envoy. SLI = sum(rate(bucket{le="250"}[window])) /
+        sum(rate(count[window])).
+    objective: 0.95             # 95% of requests under 250 ms
+    window: 30d
+    error_budget_minutes_per_30d: 2160   # (1 - 0.95) * 30d in minutes
+    burn_rate_alerts:
+      - severity: page
+        burn_rate: 14.4
+        window: 1h
+        rationale: >
+          Rapid latency spike (e.g., GPU saturation, Redis timeout cascade).
+          14.4× burn in 1 h is symptomatic of an active incident; page on-call.
+      - severity: ticket
+        burn_rate: 6
+        window: 6h
+        rationale: >
+          Gradual latency creep (memory leak, slow batch queue buildup).
+          File a ticket; resolve within 24 h to protect the monthly budget.
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # SLO 3 — p99 Latency
+  # Tighter tail-latency objective to catch outlier requests early.
+  # ───────────────────────────────────────────────────────────────────────────
+  - name: latency_p99
+    description: >
+      99% of requests complete end-to-end within 500 ms. This SLO targets
+      tail-latency outliers caused by GC pauses, cold Redis misses, or
+      occasional batch=1 inference stalls that would not be caught by the
+      p95 SLO alone.
+    sli:
+      type: request_based
+      good_requests: >
+        HTTP requests where end_to_end_latency_ms < 500.
+        Same measurement methodology as latency_p95 (Envoy %RESPONSE_DURATION%).
+      total_requests: >
+        All non-cancelled inbound HTTP requests.
+      measurement: >
+        Prometheus histogram `http_request_duration_ms_bucket` with le="500".
+        SLI = sum(rate(bucket{le="500"}[window])) / sum(rate(count[window])).
+    objective: 0.99             # 99% of requests under 500 ms
+    window: 30d
+    error_budget_minutes_per_30d: 432    # (1 - 0.99) * 30d in minutes
+    burn_rate_alerts:
+      - severity: page
+        burn_rate: 14.4
+        window: 1h
+        rationale: >
+          1% of requests exceeding 500 ms at 14.4× burn indicates a systemic
+          tail-latency problem (e.g., hot shard, network partition to Redis).
+          Page immediately; tail latency often precedes broader degradation.
+      - severity: ticket
+        burn_rate: 6
+        window: 6h
+        rationale: >
+          Gradual tail-latency growth. Investigate JVM/Go GC tuning,
+          Redis eviction policy, or dynamic batching wait-window misconfiguration.
+      - severity: info
+        burn_rate: 2
+        window: 24h
+        rationale: >
+          Low-grade p99 creep over a day. Log for weekly review; likely a
+          slow memory leak or steady increase in request payload sizes.
